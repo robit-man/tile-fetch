@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>OSM minimap → Wayback tile fetch</title>
+
+<!-- Leaflet (CDN) -->
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+  crossorigin=""
+/>
+<script
+  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+  crossorigin=""
+></script>
+
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font: 14px/1.4 system-ui, Segoe UI, Roboto, sans-serif; background:#0b0b0c; color:#eaeaea; }
+  header { padding: 14px 16px; border-bottom:1px solid #222; }
+  h1 { font-size: 16px; margin: 0; }
+  .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px; }
+  #map { height: 360px; width: 360px; border:1px solid #222; border-radius:12px; }
+  .panel { border:1px solid #222; border-radius:12px; padding:12px; display:flex; flex-direction:column; gap:10px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  label { min-width: 120px; color:#bdbdbd; }
+  input, select { background:#131316; color:#eee; border:1px solid #2a2a2a; border-radius:10px; padding:8px 10px; }
+  button { background:#1b1; color:#fff; border:1px solid #274; border-radius:10px; padding:9px 12px; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  .secondary { background:#1b1b1c; border-color:#333; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  .tilebox { display:flex; gap:16px; align-items:flex-start; }
+  #tile { width:256px; height:256px; border:1px solid #222; border-radius:12px; background:#000; image-rendering: pixelated; }
+  small { color:#9aa; }
+  footer { padding: 8px 16px; color:#9aa; font-size:12px; }
+  a { color:#8fd; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OSM minimap → fetch Wayback (historical imagery) tile for a given time period</h1>
+</header>
+
+<div class="wrap">
+  <div id="map" aria-label="OSM minimap"></div>
+
+  <div class="panel">
+    <div class="row">
+      <label>Wayback version ID</label>
+      <input id="version" value="49849" placeholder="e.g. 49849" />
+      <small>Time period selector (paste your vintage ID)</small>
+    </div>
+
+    <div class="row">
+      <label>Zoom (TileMatrix)</label>
+      <input id="zoom" type="number" min="0" max="23" step="1" value="16" />
+      <button id="useMapZoom" class="secondary" title="Use map's current zoom">Use map zoom</button>
+    </div>
+
+    <div class="row">
+      <label>From map center</label>
+      <button id="fetch" title="Use current map center & zoom">Fetch tile</button>
+      <button id="clear" class="secondary">Clear overlay</button>
+    </div>
+
+    <div class="tilebox">
+      <img id="tile" alt="Tile preview" crossorigin="anonymous" />
+      <div>
+        <div><b>Tile URL</b></div>
+        <div id="url" class="mono"></div>
+        <div style="margin-top:8px"><b>Info</b></div>
+        <div id="info" class="mono"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  Base map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors ·
+  Imagery tiles via Esri Wayback WMTS · This page computes <code>{z}/{y}/{x}</code> from the map center on click.
+</footer>
+
+<script>
+// ---------- OSM minimap ----------
+const map = L.map('map', { zoomControl:true }).setView([37.7749, -122.4194], 16);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 20,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+// ---------- Wayback WMTS base ----------
+const WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
+
+// ---------- helpers ----------
+function lonLatToTileXY(lonDeg, latDeg, z) {
+  const latRad = latDeg * Math.PI / 180;
+  const n = Math.pow(2, z);
+  const x = Math.floor((lonDeg + 180) / 360 * n);
+  const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+  return { x, y, n };
+}
+
+// tile bounds (in WGS84) for drawing a rectangle on the minimap
+function tileXYToBounds(x, y, z) {
+  const n = Math.pow(2, z);
+  const lon = (tx) => tx / n * 360 - 180;
+  const lat = (ty) => {
+    const rad = Math.atan(Math.sinh(Math.PI * (1 - 2 * ty / n)));
+    return rad * 180 / Math.PI;
+  };
+  const west = lon(x), east = lon(x+1);
+  const north = lat(y), south = lat(y+1);
+  return [[south, west], [north, east]];
+}
+
+function urlFor(version, z, y, x) {
+  return `${WMTS_ROOT}/tile/${version}/${z}/${y}/${x}`;
+}
+
+function setText(id, txt) {
+  document.getElementById(id).textContent = txt;
+}
+
+let tileRect = null;
+function drawTileRect(bounds) {
+  if (tileRect) map.removeLayer(tileRect);
+  tileRect = L.rectangle(bounds, { color:'#66ff66', weight:1, fill:false, interactive:false });
+  tileRect.addTo(map);
+}
+
+// ---------- UI wiring ----------
+const $version = document.getElementById('version');
+const $zoom = document.getElementById('zoom');
+const $useMapZoom = document.getElementById('useMapZoom');
+const $fetch = document.getElementById('fetch');
+const $clear = document.getElementById('clear');
+const $tile = document.getElementById('tile');
+
+$useMapZoom.onclick = () => { $zoom.value = map.getZoom(); };
+
+$clear.onclick = () => {
+  if (tileRect) { map.removeLayer(tileRect); tileRect = null; }
+  $tile.removeAttribute('src');
+  setText('url', '');
+  setText('info', '');
+};
+
+$fetch.onclick = () => {
+  const version = $version.value.trim();
+  const z = parseInt($zoom.value, 10);
+  const center = map.getCenter();
+  const { x, y } = lonLatToTileXY(center.lng, center.lat, z);
+
+  const u = urlFor(version, z, y, x);
+  $tile.src = u + (u.includes('?') ? '&' : '?') + 'ts=' + Date.now();
+  setText('url', u);
+
+  const b = tileXYToBounds(x, y, z);
+  drawTileRect(b);
+
+  const info = `center: ${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}
+z/x/y: ${z}/${x}/${y}
+bounds: [S ${b[0][0].toFixed(6)}, W ${b[0][1].toFixed(6)}] → [N ${b[1][0].toFixed(6)}, E ${b[1][1].toFixed(6)}]`;
+  setText('info', info);
+};
+
+// keep zoom input in sync if user zooms with controls
+map.on('zoomend', () => { $zoom.value = map.getZoom(); });
+</script>
+</body>
+</html>
